@@ -350,6 +350,27 @@ Returns (PATCH-STRING . CHANGE-COUNT) or nil when no changes fall in the range."
                                       (length (nth 3 h)))) ; add-lines
                                  output-hunks)))))))
 
+(defun branch-off/worktree--current-branch-off ()
+  "Return the nearest branch-off hash in HEAD's ancestry when inside a branch-off worktree.
+A branch-off worktree has a detached HEAD and lives at .worktree/<40-hex-chars>.
+Walks from HEAD back to the initial commit looking for refs/branch-off/<hash>.
+Returns the hash string, or nil when not in a branch-off worktree."
+  (let ((top (magit-toplevel)))
+    (when (and top
+               (not (magit-git-string "symbolic-ref" "--short" "HEAD"))
+               (string-match "/\\.worktree/\\([0-9a-f]\\{40\\}\\)/?$" top))
+      (let* ((initial  (match-string 1 top))
+             (commits  (split-string
+                        (with-temp-buffer
+                          (call-process "git" nil t nil
+                                        "rev-list" (format "%s^..HEAD" initial))
+                          (buffer-string))
+                        "\n" t)))
+        (cl-find-if (lambda (h)
+                      (magit-git-string "rev-parse" "--verify"
+                                        (format "refs/branch-off/%s" h)))
+                    commits)))))
+
 (defun branch-off/magit-stage-and-commit ()
   "Stage the selected lines and open a new commit.
 Requires an active region.  Stages only the +lines within the selection
@@ -382,6 +403,16 @@ Requires an active region.  Stages only the +lines within the selection
                   (user-error "git apply --cached failed:\n%s" (buffer-string)))))
           (ignore-errors (delete-file tmp)))
         (message "Staged %d change%s" count (if (= count 1) "" "s"))
+        (when-let ((old-bo (branch-off/worktree--current-branch-off)))
+          (letrec ((hook (lambda ()
+                           (remove-hook 'magit-post-commit-hook hook)
+                           (let ((default-directory top))
+                             (let* ((new-hash (magit-git-string "rev-parse" "HEAD"))
+                                    (new-ref  (format "refs/branch-off/%s" new-hash))
+                                    (old-ref  (format "refs/branch-off/%s" old-bo)))
+                               (magit-call-git "update-ref" new-ref new-hash)
+                               (magit-call-git "update-ref" "-d" old-ref))))))
+            (add-hook 'magit-post-commit-hook hook)))
         (magit-commit-create)))))
 
 (map! :after magit
@@ -441,30 +472,57 @@ Requires an active region.  Stages only the +lines within the selection
     (let ((branch-off/magit-log-flat--pending t))
       (magit-log-setup-buffer (list "--all") (list "--color" "--decorate" "--topo-order" "-n256") nil)))
 
-  (defun branch-off/magit-log-mark-archive ()
-    "Overlay 2-space indent on branched-off commits in flat log buffers.
-A commit is considered branched off when it is reachable from any ref
-but is not an ancestor of HEAD — regardless of which ref namespace holds it."
+  (defun branch-off/magit-log--mark ()
+    "Overlay depth-based indent on branch-off commits in flat log buffers.
+Commits reachable from refs/branch-off/* but not from refs/heads/* are
+branch-off commits.  Depth 1 (2 spaces) = directly off a branch head;
+each further level adds 2 more spaces.  Uses magit's section API for hash
+extraction so worktree @ markers and other decorations don't interfere."
     (when (derived-mode-p 'magit-log-mode)
       (when branch-off/magit-log-flat--pending
         (setq-local branch-off/magit-log-flat t))
-      (remove-overlays (point-min) (point-max) 'branch-off/archive-marker t))
+      (remove-overlays (point-min) (point-max) 'branch-off/log-marker t))
     (when (and (derived-mode-p 'magit-log-mode)
                (bound-and-true-p branch-off/magit-log-flat))
-      (let ((hashes (magit-git-lines "log" "--format=%H" "--all" "--not" "HEAD")))
-        (when hashes
-          (save-excursion
-            (goto-char (point-min))
-            (while (not (eobp))
-              (when (and (looking-at "^\\([0-9a-f]\\{7,40\\}\\)")
-                         (let ((h (match-string 1)))
-                           (cl-some (lambda (full) (string-prefix-p h full)) hashes)))
-                (let ((ov (make-overlay (point) (point))))
-                  (overlay-put ov 'before-string "  ")
-                  (overlay-put ov 'branch-off/archive-marker t)))
-              (forward-line 1)))))))
+      (let* ((raw (magit-git-lines "log" "--format=%H %P"
+                                   "--glob=refs/branch-off/*"
+                                   "--not" "--glob=refs/heads/*"))
+             (parent-map  (make-hash-table :test #'equal))
+             (bo-hashes   nil)
+             (depth-cache (make-hash-table :test #'equal)))
+        (dolist (line raw)
+          (when (string-match
+                 "^\\([0-9a-f]\\{40\\}\\)\\(?: \\([0-9a-f]\\{40\\}\\)\\)?" line)
+            (let ((h (match-string 1 line))
+                  (p (match-string 2 line)))
+              (puthash h p parent-map)
+              (push h bo-hashes))))
+        (when bo-hashes
+          (cl-labels
+              ((in-bo-p (h)
+                 (not (eq (gethash h parent-map 'absent) 'absent)))
+               (depth-of (h)
+                 (or (gethash h depth-cache)
+                     (let* ((p (gethash h parent-map))
+                            (d (if (and p (in-bo-p p))
+                                   (1+ (depth-of p))
+                                 1)))
+                       (puthash h d depth-cache)
+                       d))))
+            (save-excursion
+              (goto-char (point-min))
+              (while (not (eobp))
+                (when-let* ((h    (magit-section-value-if 'commit))
+                            (full (cl-find-if (lambda (f) (string-prefix-p h f))
+                                              bo-hashes)))
+                  (let* ((d  (depth-of full))
+                         (ov (make-overlay (line-beginning-position)
+                                           (line-beginning-position))))
+                    (overlay-put ov 'before-string (make-string (* d 2) ?\s))
+                    (overlay-put ov 'branch-off/log-marker t)))
+                (forward-line 1))))))))
 
-  (add-hook 'magit-refresh-buffer-hook #'branch-off/magit-log-mark-archive)
+  (add-hook 'magit-refresh-buffer-hook #'branch-off/magit-log--mark)
 
   (defun branch-off/magit-status-tab ()
     "On a commit section show it; otherwise toggle the section."
