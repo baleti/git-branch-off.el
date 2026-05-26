@@ -474,21 +474,29 @@ Requires an active region.  Stages only the +lines within the selection
 
   (defun branch-off/magit-log--mark ()
     "Overlay depth-based indent on branch-off commits in flat log buffers.
-Commits reachable from refs/branch-off/* but not from refs/heads/* are
-branch-off commits.  Depth 1 (2 spaces) = directly off a branch head;
-each further level adds 2 more spaces.  Uses magit's section API for hash
-extraction so worktree @ markers and other decorations don't interfere."
+Commits reachable from any ref but not from refs/heads/* are candidates;
+this includes branch-off refs and detached worktree HEADs.  Depth is
+computed from ancestry: depth 1 = directly off a branch head, crossing
+a commit with a refs/branch-off/* ref adds one level (2 spaces).
+Uses magit's section API for hash extraction."
     (when (derived-mode-p 'magit-log-mode)
       (when branch-off/magit-log-flat--pending
         (setq-local branch-off/magit-log-flat t))
-      (remove-overlays (point-min) (point-max) 'branch-off/log-marker t))
+      (remove-overlays (point-min) (point-max) 'branch-off/log-marker t)
+      (remove-overlays (point-min) (point-max) 'branch-off/archive-marker t))
     (when (and (derived-mode-p 'magit-log-mode)
                (bound-and-true-p branch-off/magit-log-flat))
       (let* ((raw (magit-git-lines "log" "--format=%H %P"
-                                   "--glob=refs/branch-off/*"
+                                   "--all"
                                    "--not" "--glob=refs/heads/*"))
              (parent-map  (make-hash-table :test #'equal))
-             (bo-hashes   nil)
+             (all-hashes  nil)
+             (bo-ref-set  (let ((tbl (make-hash-table :test #'equal)))
+                            (dolist (h (magit-git-lines "for-each-ref"
+                                                        "--format=%(objectname)"
+                                                        "refs/branch-off/"))
+                              (puthash h t tbl))
+                            tbl))
              (depth-cache (make-hash-table :test #'equal)))
         (dolist (line raw)
           (when (string-match
@@ -496,17 +504,21 @@ extraction so worktree @ markers and other decorations don't interfere."
             (let ((h (match-string 1 line))
                   (p (match-string 2 line)))
               (puthash h p parent-map)
-              (push h bo-hashes))))
-        (when bo-hashes
+              (push h all-hashes))))
+        (when all-hashes
           (cl-labels
               ((in-bo-p (h)
                  (not (eq (gethash h parent-map 'absent) 'absent)))
                (depth-of (h)
                  (or (gethash h depth-cache)
                      (let* ((p (gethash h parent-map))
-                            (d (if (and p (in-bo-p p))
-                                   (1+ (depth-of p))
-                                 1)))
+                            (d (if (or (null p) (not (in-bo-p p)))
+                                   1
+                                 (let ((pd (depth-of p)))
+                                   (if (or (gethash p bo-ref-set)
+                                           (gethash h bo-ref-set))
+                                       (1+ pd)
+                                     pd)))))
                        (puthash h d depth-cache)
                        d))))
             (save-excursion
@@ -514,7 +526,7 @@ extraction so worktree @ markers and other decorations don't interfere."
               (while (not (eobp))
                 (when-let* ((h    (magit-section-value-if 'commit))
                             (full (cl-find-if (lambda (f) (string-prefix-p h f))
-                                              bo-hashes)))
+                                              all-hashes)))
                   (let* ((d  (depth-of full))
                          (ov (make-overlay (line-beginning-position)
                                            (line-beginning-position))))
@@ -1662,3 +1674,153 @@ Also falls through for regular (non-branch-off) commits."
   (map! :map magit-blob-mode-map
         :n "n" #'branch-off/magit-blob-next
         :n "p" #'branch-off/magit-blob-prev))
+
+;;; Pickaxe — SPC s g
+;; git grep across ALL committed blobs; consult preview via `git show sha:file';
+;; selection opens the exact blob in magit-find-file (magit-blob-mode → n/p navigates history).
+
+(defun my/magit-pickaxe--commit-cache ()
+  "Return a hash table mapping full SHA → \"YYYY-MM-DD  author\" for all commits."
+  (let ((tbl (make-hash-table :test #'equal :size 256)))
+    (with-temp-buffer
+      (call-process "git" nil t nil "log" "--all" "--format=%H\t%as\t%an")
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let ((line (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))
+          (when (string-match "^\\([0-9a-f]\\{40\\}\\)\t\\([^\t]*\\)\t\\(.*\\)$" line)
+            (puthash (match-string 1 line)
+                     (concat (match-string 2 line) "  " (match-string 3 line))
+                     tbl)))
+        (forward-line 1)))
+    tbl))
+
+(defun my/magit-pickaxe--parse-line (line cache)
+  "Parse one `git grep -n' history line into a propertized candidate, or nil.
+Expected format from searching explicit commits: <40-sha>:<file>:<lineno>:<content>"
+  (when (string-match
+         "^\\([0-9a-f]\\{40\\}\\):\\([^:\n]+\\):\\([0-9]+\\):\\(.*\\)$"
+         line)
+    (let* ((hash   (match-string 1 line))
+           (file   (match-string 2 line))
+           (lineno (string-to-number (match-string 3 line)))
+           (cont   (match-string 4 line))
+           (short  (substring hash 0 8))
+           (info   (gethash hash cache ""))
+           (cand   (concat (propertize short 'face 'magit-hash)
+                           ":" (propertize file 'face 'consult-file)
+                           ":" (propertize (number-to-string lineno)
+                                           'face 'consult-line-number)
+                           ": " cont)))
+      (put-text-property 0 1 'my/hash  hash   cand)
+      (put-text-property 0 1 'my/file  file   cand)
+      (put-text-property 0 1 'my/line  lineno cand)
+      ;; Group header shown in vertico: "abc12345  2026-05-26  author"
+      (put-text-property 0 1 'consult--prefix-group
+                         (concat short "  " info) cand)
+      cand)))
+
+(defun my/magit-pickaxe--format-lines (lines cache)
+  "Filter and format a batch of git grep output LINES into candidates using CACHE."
+  (delq nil (mapcar (lambda (l) (my/magit-pickaxe--parse-line l cache)) lines)))
+
+(defun my/magit-pickaxe--git-builder (input)
+  "Return (cmd . nil) running git grep across every committed blob for INPUT."
+  (pcase-let ((`(,arg . ,_) (consult--command-split input)))
+    (unless (string-blank-p arg)
+      (cons (list "sh" "-c"
+                  (format
+                   "git --no-pager grep -In -e %s $(git rev-list --all 2>/dev/null) 2>/dev/null"
+                   (shell-quote-argument arg)))
+            nil))))
+
+(defun my/magit-pickaxe--state ()
+  "State: preview git blobs in-place via git-show; open as magit-find-file on return.
+Consult calls us inside `with-selected-window' on the original (non-minibuffer) window,
+so `selected-window' is the right target for showing the preview."
+  (let ((pbuf (get-buffer-create " *pickaxe-preview*"))
+        restore-fn
+        line-ov)
+    (lambda (action cand)
+      (pcase action
+        ('preview
+         (when restore-fn (funcall restore-fn) (setq restore-fn nil))
+         (when cand
+           (let* ((hash (get-text-property 0 'my/hash cand))
+                  (file (get-text-property 0 'my/file cand))
+                  (line (get-text-property 0 'my/line cand))
+                  (win  (selected-window)))
+             (when (and hash file line)
+               (with-current-buffer pbuf
+                 (let ((inhibit-read-only t))
+                   (when (overlayp line-ov) (delete-overlay line-ov) (setq line-ov nil))
+                   (erase-buffer)
+                   (when (= 0 (call-process "git" nil t nil "show"
+                                            (format "%s:%s" hash file)))
+                     ;; Auto-detect mode from filename. delay-mode-hooks queues hooks;
+                     ;; clearing delayed-mode-hooks after discards them so they never
+                     ;; fire in a wrong context (e.g. vertico's minibuffer rendering).
+                     (delay-mode-hooks
+                       (let ((buffer-file-name file))
+                         (set-auto-mode)))
+                     (setq delayed-mode-hooks nil)
+                     (font-lock-ensure)
+                     (goto-char (point-min))
+                     (forward-line (1- line))
+                     (setq line-ov
+                           (make-overlay (line-beginning-position)
+                                         (min (1+ (line-end-position)) (point-max))))
+                     (overlay-put line-ov 'face 'consult-preview-line)
+                     (overlay-put line-ov 'priority 2)
+                     (setq buffer-read-only t))))
+               (let ((prev-buf (window-buffer win))
+                     (prev-pt  (window-point win)))
+                 (setq restore-fn
+                       (lambda ()
+                         (when (window-live-p win)
+                           (set-window-buffer win prev-buf)
+                           (set-window-point win prev-pt))))
+                 (set-window-buffer win pbuf)
+                 (set-window-point win (with-current-buffer pbuf (point))))))))
+        ('return
+         ;; 'exit fires before 'return and already cleans up; guard defensively.
+         (when (overlayp line-ov) (delete-overlay line-ov) (setq line-ov nil))
+         (when restore-fn (funcall restore-fn) (setq restore-fn nil))
+         (when (buffer-live-p pbuf) (kill-buffer pbuf))
+         (when cand
+           (let* ((hash (get-text-property 0 'my/hash cand))
+                  (file (get-text-property 0 'my/file cand))
+                  (line (get-text-property 0 'my/line cand)))
+             (when (and hash file line)
+               (magit-find-file hash file)
+               (goto-char (point-min))
+               (forward-line (1- line))
+               (recenter)))))
+        ('exit
+         (when (overlayp line-ov) (delete-overlay line-ov) (setq line-ov nil))
+         (when restore-fn (funcall restore-fn) (setq restore-fn nil))
+         (when (buffer-live-p pbuf) (kill-buffer pbuf)))))))
+
+(defun my/magit-pickaxe-ripgrep ()
+  "Search ALL committed git blobs for a pattern; consult preview; open as magit-find-file."
+  (interactive)
+  (let* ((top   (or (magit-toplevel) (user-error "Not in a git repository")))
+         (default-directory top)
+         (cache (my/magit-pickaxe--commit-cache)))
+    (consult--read
+     (consult--process-collection #'my/magit-pickaxe--git-builder
+       :transform (consult--async-transform
+                   (lambda (lines) (my/magit-pickaxe--format-lines lines cache)))
+       :file-handler t)
+     :prompt "Pickaxe: "
+     :lookup #'consult--lookup-member
+     :state (my/magit-pickaxe--state)
+     :add-history (thing-at-point 'symbol)
+     :require-match t
+     :category 'consult-grep
+     :group #'consult--prefix-group
+     :history '(:input consult--grep-history)
+     :sort nil)))
+
+(map! :leader
+      :desc "Pickaxe (git history → magit-blob)" "s g" #'my/magit-pickaxe-ripgrep)
