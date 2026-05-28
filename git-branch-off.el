@@ -1985,9 +1985,10 @@ Also falls through for regular (non-branch-off) commits."
         :n "n" #'branch-off/magit-blob-next
         :n "p" #'branch-off/magit-blob-prev))
 
-;;; Git history search — SPC s g {f,g,S,a}
-;; Four commands sharing a common preview mechanism:
-;;   SPC s g f  — filename history (add/remove events only)
+;;; Git history search — SPC s g {f,F,S,a}
+;; Commands sharing a common preview mechanism:
+;;   SPC s g f  — file revision browser: pick a file, flick through every revision
+;;   SPC s g F  — file add/remove events only (when was a file born/deleted)
 ;;   SPC s g S  — pickaxe -S: commits where literal match count changed
 ;;   SPC s g a  — git history search: blobs + commit messages (git grep + git log --grep)
 
@@ -2292,7 +2293,7 @@ $(git log --all -S%s --format=%%H 2>/dev/null | head -n 500) 2>/dev/null"
         (message "No file add/remove events found in git history")
       (consult--read
        cands
-       :prompt "File history (add/remove): "
+       :prompt "File add/remove events: "
        :lookup #'consult--lookup-member
        :state (my/magit-filename-history--state)
        :require-match t
@@ -2301,8 +2302,66 @@ $(git log --all -S%s --format=%%H 2>/dev/null | head -n 500) 2>/dev/null"
        :history '(:input my/magit-filename-history-history)
        :sort nil))))
 
+(defun my/magit-file-revisions--collect (cache)
+  "Return one candidate per (commit, file) pair across the full git history."
+  (let (result cur-hash)
+    (with-temp-buffer
+      (call-process "git" nil t nil "log" "--all"
+                    "--format=COMMIT\t%H" "--name-only")
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let ((line (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))
+          (cond
+           ((string-match "^COMMIT\t\\([0-9a-f]\\{40\\}\\)$" line)
+            (setq cur-hash (match-string 1 line)))
+           ((and cur-hash (not (string-empty-p line)))
+            (let* ((file  line)
+                   (short (substring cur-hash 0 8))
+                   (info  (gethash cur-hash cache ""))
+                   (cand  (concat (propertize short 'face 'magit-hash)
+                                  ":" (propertize file 'face 'consult-file))))
+              (put-text-property 0 1 'my/hash          cur-hash cand)
+              (put-text-property 0 1 'my/file          file     cand)
+              (put-text-property 0 1 'my/line          1        cand)
+              (put-text-property 0 1 'my/type          'blob    cand)
+              ;; content-start: skip "XXXXXXXX:" = 9 chars; vertico filters on
+              ;; the file path portion only.
+              (put-text-property 0 1 'my/content-start 9        cand)
+              (put-text-property 0 1 'my/group
+                                 (concat short "  " info)       cand)
+              (push cand result)))))
+        (forward-line 1)))
+    (nreverse result)))
+
+(defun my/magit-file-revisions ()
+  "Browse every (file, commit) pair in git history; filter by path/filename."
+  (interactive)
+  (my/magit-pickaxe--check-deps)
+  (let* ((top   (or (magit-toplevel) (user-error "Not in a git repository")))
+         (default-directory top)
+         (cache (my/magit-pickaxe--commit-cache))
+         (cands (my/magit-file-revisions--collect cache)))
+    (if (null cands)
+        (message "No file revisions found in git history")
+      (consult--read
+       cands
+       :prompt "File revisions: "
+       :lookup #'consult--lookup-member
+       :state (my/magit-pickaxe--make-state
+               (lambda (cand)
+                 (when-let ((hash (get-text-property 0 'my/hash cand))
+                            (f    (get-text-property 0 'my/file cand)))
+                   (magit-find-file hash f))))
+       :require-match t
+       :category 'consult-grep
+       :group #'my/magit-pickaxe--group-fn
+       :history '(:input my/magit-file-revisions-history)
+       :sort nil))))
+
 (map! :leader
       "s g" nil                                                             ; clear terminal binding
-      :desc "File add/remove history"    "s g f" #'my/magit-filename-history
+      :desc "File revision browser"      "s g f" #'my/magit-file-revisions
+      :desc "File add/remove events"     "s g F" #'my/magit-filename-history
       :desc "Pickaxe -S (count changed)" "s g S" #'my/magit-pickaxe-S
       :desc "Grep all committed blobs"   "s g a" #'my/magit-all-grep)
