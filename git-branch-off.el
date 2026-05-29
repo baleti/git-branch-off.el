@@ -2119,14 +2119,34 @@ $(git log --all -G%s --format=%%H 2>/dev/null | head -n 500) 2>/dev/null"
                           q q))
             nil))))
 
-(defun my/magit-commit-search--collect (cache)
-  "Return a list of propertized commit candidates from the full git history.
-Each candidate embeds the full commit message after \\x00 (Lisp string only,
-not from git output — call-process strips NUL bytes) so vertico filters on
-all message text while the group transform displays only the subject.
+(defun my/magit-commit-search--files-cache ()
+  "Return a hash table mapping full SHA → space-separated list of changed filenames."
+  (let ((tbl (make-hash-table :test #'equal :size 256))
+        cur-hash)
+    (with-temp-buffer
+      (call-process "git" nil t nil "log" "--all"
+                    "--format=COMMIT\t%H" "--name-only")
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let ((line (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))
+          (cond
+           ((string-match "^COMMIT\t\\([0-9a-f]\\{40\\}\\)" line)
+            (setq cur-hash (match-string 1 line)))
+           ((and cur-hash (not (string-empty-p line)))
+            (puthash cur-hash
+                     (let ((prev (gethash cur-hash tbl "")))
+                       (if (string-empty-p prev) line (concat prev " " line)))
+                     tbl))))
+        (forward-line 1)))
+    tbl))
 
-Parsing is line-by-line: a line of exactly 40 hex chars is a commit boundary.
-No special separator bytes are used in the git format string."
+(defun my/magit-commit-search--collect (cache files-cache)
+  "Return a list of propertized commit candidates from the full git history.
+Each candidate embeds author, date, full hash, and changed filenames after
+\\x00 so vertico filters on all of them while displaying only the subject.
+
+Parsing is line-by-line: a line of exactly 40 hex chars is a commit boundary."
   (let (result cur-hash cur-parts)
     (cl-flet ((flush ()
                 (when cur-hash
@@ -2137,13 +2157,14 @@ No special separator bytes are used in the git format string."
                          (message (mapconcat #'identity parts "\n"))
                          (short   (substring cur-hash 0 8))
                          (info    (gethash cur-hash cache ""))
+                         (files   (gethash cur-hash files-cache ""))
+                         (hidden  (concat message "\n" info "\n" files "\n" cur-hash))
                          (cand    (concat (propertize short 'face 'magit-hash)
-                                          " " (propertize "[msg] " 'face 'font-lock-comment-face)
-                                          subject
-                                          "\x00" message)))
+                                          "  " subject
+                                          "\x00" hidden)))
                     (put-text-property 0 1 'my/hash          cur-hash cand)
                     (put-text-property 0 1 'my/type          'commit  cand)
-                    (put-text-property 0 1 'my/content-start 9        cand)
+                    (put-text-property 0 1 'my/content-start 10       cand)
                     (put-text-property 0 1 'my/group         (concat short "  " info) cand)
                     (push cand result))
                   (setq cur-hash nil cur-parts nil))))
@@ -2195,24 +2216,33 @@ No special separator bytes are used in the git format string."
         (forward-line 1)))
     (nreverse result)))
 
-(defun my/magit-pickaxe--apply-highlights (query)
+(defun my/magit-pickaxe--apply-highlights (query &optional cur-beg cur-end case-sensitive)
   "Add highlight overlays for each word in QUERY in the current buffer.
 Overlays layer on top of font-lock so they add a background without losing the
-foreground colour. Background comes from the `match' face (no inheritance, so
-only an explicitly-defined theme background is used) with #5f4000 as fallback."
-  (let ((case-fold-search t)
-        (bg (or (face-background 'match nil nil) "#5f4000")))
+foreground colour. Uses the theme's orange (via doom-color if available),
+otherwise lazy-highlight face background, otherwise a bright amber fallback.
+When CUR-BEG and CUR-END are given, matches within that range use the `isearch'
+face (theme's \"you are here\" indicator) at higher priority to stand out clearly.
+When CASE-SENSITIVE is non-nil the search respects case."
+  (let ((case-fold-search (not case-sensitive))
+        (bg (or (and (fboundp 'doom-color) (doom-color 'orange))
+                (face-background 'lazy-highlight nil t)
+                "#af7800")))
     (when (and query (not (string-blank-p query)))
       (dolist (term (split-string query nil t))
         (save-excursion
           (goto-char (point-min))
           (while (re-search-forward (regexp-quote term) nil t)
-            (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
-              (overlay-put ov 'face `(:background ,bg :extend nil))
-              (overlay-put ov 'priority 3)
+            (let* ((mbeg (match-beginning 0))
+                   (mend (match-end 0))
+                   (current-p (and cur-beg cur-end
+                                   (>= mbeg cur-beg) (<= mend cur-end)))
+                   (ov (make-overlay mbeg mend)))
+              (overlay-put ov 'face (if current-p 'isearch `(:background ,bg :extend nil)))
+              (overlay-put ov 'priority (if current-p 4 3))
               (overlay-put ov 'my/query-hl t))))))))
 
-(defun my/magit-pickaxe--make-state (on-return &optional highlight-query)
+(defun my/magit-pickaxe--make-state (on-return &optional highlight-query case-sensitive)
   "Return a consult state function; ON-RETURN is called with the selected candidate.
 When HIGHLIGHT-QUERY is non-nil, query terms get an amber background in the
 preview via text properties (wiped automatically by erase-buffer each cycle)."
@@ -2291,7 +2321,10 @@ preview via text properties (wiped automatically by erase-buffer each cycle)."
                        (goto-char (point-min))
                        (forward-line (1- line))
                        (if highlight-query
-                           (my/magit-pickaxe--apply-highlights mbquery)
+                           (my/magit-pickaxe--apply-highlights
+                            mbquery
+                            (line-beginning-position) (line-end-position)
+                            case-sensitive)
                          (setq line-ov
                                (make-overlay (line-beginning-position)
                                              (min (1+ (line-end-position)) (point-max))))
@@ -2333,10 +2366,10 @@ preview via text properties (wiped automatically by erase-buffer each cycle)."
        (magit-show-commit hash)))
    t))
 
-(defun my/magit-grep-read (builder prompt &optional highlight-query)
+(defun my/magit-grep-read (builder prompt &optional highlight-query case-sensitive)
   "Run an async git content-search session using BUILDER and PROMPT.
-When HIGHLIGHT-QUERY is non-nil, blob previews use substring highlights
-instead of a line overlay (intended for SPC s g S and SPC s g G)."
+When HIGHLIGHT-QUERY is non-nil, blob previews use substring highlights instead
+of a line overlay. When CASE-SENSITIVE is non-nil highlights respect case."
   (my/magit-pickaxe--check-deps)
   (let* ((top   (or (magit-toplevel) (user-error "Not in a git repository")))
          (default-directory top)
@@ -2362,7 +2395,7 @@ instead of a line overlay (intended for SPC s g S and SPC s g G)."
                               (goto-char (point-min))
                               (forward-line (1- line))
                               (recenter))))))
-             highlight-query)
+             highlight-query case-sensitive)
      :add-history (thing-at-point 'symbol)
      :require-match t
      :category 'consult-grep
@@ -2380,31 +2413,32 @@ instead of a line overlay (intended for SPC s g S and SPC s g G)."
 (defun my/magit-all-grep ()
   "Search content across all committed blobs and commit messages."
   (interactive)
-  (my/magit-grep-read #'my/magit-all-grep--builder "Git blob search: " t))
+  (my/magit-grep-read #'my/magit-all-grep--builder "Git blob search: " t t))
 
 (defun my/magit-pickaxe-S ()
   "Pickaxe -S: find commits where the literal occurrence count of a string changed."
   (interactive)
-  (my/magit-grep-read #'my/magit-pickaxe-S--builder "Pickaxe -S (count changed): " t))
+  (my/magit-grep-read #'my/magit-pickaxe-S--builder "Pickaxe -S (count changed): " t t))
 
 (defun my/magit-pickaxe-G ()
   "Pickaxe -G: find commits whose diff has a line matching a regex."
   (interactive)
-  (my/magit-grep-read #'my/magit-pickaxe-G--builder "Pickaxe -G (regex): " t))
+  (my/magit-grep-read #'my/magit-pickaxe-G--builder "Pickaxe -G (regex): " t t))
 
 (defun my/magit-commit-search ()
-  "Search commit messages; shows all commits on open, type to filter by subject."
+  "Search commits by message, author, date, hash, or changed filenames."
   (interactive)
   (my/magit-pickaxe--check-deps)
-  (let* ((top   (or (magit-toplevel) (user-error "Not in a git repository")))
+  (let* ((top         (or (magit-toplevel) (user-error "Not in a git repository")))
          (default-directory top)
-         (cache (my/magit-pickaxe--commit-cache))
-         (cands (my/magit-commit-search--collect cache)))
+         (cache       (my/magit-pickaxe--commit-cache))
+         (files-cache (my/magit-commit-search--files-cache))
+         (cands       (my/magit-commit-search--collect cache files-cache)))
     (if (null cands)
         (message "No commits found in git history")
       (consult--read
        cands
-       :prompt "Commit messages: "
+       :prompt "Commit: "
        :lookup #'consult--lookup-member
        :state (my/magit-commit-search--state)
        :require-match t
