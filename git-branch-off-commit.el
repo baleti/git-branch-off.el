@@ -1,11 +1,12 @@
-;;; +magit/commit.el --- Commit operations  -*- lexical-binding: t; -*-
+;;; git-branch-off-commit.el --- Commit operations  -*- lexical-binding: t; -*-
+
+(require 'git-branch-off-stage)
 
 ;;; Stage-and-commit helpers
 
-(defun branch-off/worktree--current-branch-off ()
+(defun git-branch-off--current-branch-off ()
   "Return the nearest branch-off hash in HEAD's ancestry when inside a branch-off worktree.
 A branch-off worktree has a detached HEAD and lives at .worktree/<40-hex-chars>.
-Walks from HEAD back to the initial commit looking for refs/branch-off/<hash>.
 Returns the hash string, or nil when not in a branch-off worktree."
   (let ((top (magit-toplevel)))
     (when (and top
@@ -23,7 +24,7 @@ Returns the hash string, or nil when not in a branch-off worktree."
                                         (format "refs/branch-off/%s" h)))
                     commits)))))
 
-(defun branch-off/magit-stage-and-commit ()
+(defun git-branch-off-stage-and-commit ()
   "Stage the selected lines and open a new commit.
 Requires an active region.  Stages only the +lines within the selection
 (line precision), skipping context and deleted lines."
@@ -34,13 +35,13 @@ Requires an active region.  Stages only the +lines within the selection
     (user-error "Not visiting a file"))
   (let* ((top  (or (magit-toplevel) (user-error "Not in a git repository")))
          (rel  (file-relative-name buffer-file-name top))
-         (range (branch-off/magit--selection-lines)))
+         (range (git-branch-off--selection-lines)))
     (when (buffer-modified-p) (save-buffer))
     (let* ((default-directory top)
            (diff   (with-temp-buffer
                      (call-process "git" nil t nil "diff" "-U0" "--" rel)
                      (buffer-string)))
-           (result (branch-off/magit--patch-from-diff diff rel (car range) (cdr range))))
+           (result (git-branch-off--patch-from-diff diff rel (car range) (cdr range))))
       (unless result
         (user-error "No changes in selection to stage"))
       (let* ((patch (car result))
@@ -55,7 +56,7 @@ Requires an active region.  Stages only the +lines within the selection
                   (user-error "git apply --cached failed:\n%s" (buffer-string)))))
           (ignore-errors (delete-file tmp)))
         (message "Staged %d change%s" count (if (= count 1) "" "s"))
-        (when-let ((old-bo (branch-off/worktree--current-branch-off)))
+        (when-let ((old-bo (git-branch-off--current-branch-off)))
           (letrec ((hook (lambda ()
                            (remove-hook 'magit-post-commit-hook hook)
                            (let ((default-directory top))
@@ -69,7 +70,7 @@ Requires an active region.  Stages only the +lines within the selection
 
 ;;; Commit-and-branch-off
 
-(defun branch-off/magit--only-additions-in-selection-p (diff sel-start sel-end)
+(defun git-branch-off--only-additions-in-selection-p (diff sel-start sel-end)
   "Return nil if every line in [SEL-START..SEL-END] is a pure addition in DIFF.
 Returns a human-readable error string describing the first problem found."
   (let ((new-cursor 0)
@@ -106,12 +107,11 @@ Returns a human-readable error string describing the first problem found."
           (when missing
             "selection contains unchanged lines — select only newly added lines")))))
 
-(defun branch-off/magit-stage-and-commit-and-branch-off ()
+(defun git-branch-off-stage-and-commit-branch-off ()
   "Stage the selected newly-added lines, commit, preserve under refs/branch-off/, then rewind.
 
-Requires an active region containing only pure additions (lines added since
-the last commit, not modifications or deletions).  Aborts with an explanation
-if the selection contains anything else.
+Requires an active region containing only pure additions.  Aborts with an
+explanation if the selection contains modifications or deletions.
 
 The commit is preserved under refs/branch-off/<full-hash>.  HEAD and the
 index are rewound with --mixed.  The committed additions are removed from the
@@ -124,16 +124,16 @@ working tree by reversing the staging patch."
   (let* ((top (or (magit-toplevel) (user-error "Not in a git repository")))
          (default-directory top)
          (rel (file-relative-name buffer-file-name top))
-         (range     (branch-off/magit--selection-lines)))
+         (range     (git-branch-off--selection-lines)))
     (when (buffer-modified-p) (save-buffer))
     (let* ((sel-start (car range))
            (sel-end   (cdr range))
            (diff      (with-temp-buffer
                         (call-process "git" nil t nil "diff" "-U0" "--" rel)
                         (buffer-string)))
-           (err-msg   (branch-off/magit--only-additions-in-selection-p diff sel-start sel-end))
+           (err-msg   (git-branch-off--only-additions-in-selection-p diff sel-start sel-end))
            (result    (unless err-msg
-                        (branch-off/magit--patch-from-diff diff rel sel-start sel-end))))
+                        (git-branch-off--patch-from-diff diff rel sel-start sel-end))))
       (when err-msg   (user-error "%s" err-msg))
       (unless result  (user-error "No new additions in selection"))
       (let* ((commit-msg (read-string "Commit message: ")))
@@ -169,3 +169,6 @@ check %s manually" (file-name-nondirectory buffer-file-name))))
                   (message "Branched off %s — additions removed from working tree"
                            (substring hash 0 8))))
             (ignore-errors (delete-file staging-patch))))))))
+
+(provide 'git-branch-off-commit)
+;;; git-branch-off-commit.el ends here

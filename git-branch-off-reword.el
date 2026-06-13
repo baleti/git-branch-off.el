@@ -1,35 +1,8 @@
-;;; +magit/reword.el --- Commit reword and remove  -*- lexical-binding: t; -*-
+;;; git-branch-off-reword.el --- Commit reword and remove  -*- lexical-binding: t; -*-
 
-;;; Commit reword
+;;; Shared git plumbing
 
-(defvar-local branch-off/magit-reword--commit nil)
-(defvar-local branch-off/magit-reword--source-buffer nil)
-(defvar-local branch-off/magit-reword--source-line nil)
-(defvar-local branch-off/magit-reword--from-revision nil)
-
-(defun branch-off/magit-reword--fix-highlight ()
-  "Reposition highlights to the current line after a programmatic cursor move."
-  (mapc #'delete-overlay magit-section-highlight-overlays)
-  (setq magit-section-highlight-overlays nil)
-  (hl-line-highlight))
-
-(defun branch-off/magit-reword--refresh-log (line)
-  "Refresh the magit-log buffer and restore point to LINE."
-  (when-let ((log-buf (magit-get-mode-buffer 'magit-log-mode)))
-    (with-current-buffer log-buf (magit-refresh))
-    (when-let ((win (get-buffer-window log-buf)))
-      (with-selected-window win
-        (goto-char (point-min))
-        (forward-line (1- line))
-        (branch-off/magit-reword--fix-highlight))
-      (run-with-timer 0 nil
-        (lambda ()
-          (when-let ((w (get-buffer-window log-buf)))
-            (with-selected-window w
-              (forward-line 1)
-              (forward-line -1))))))))
-
-(defun branch-off/magit-reword--parse-commit (hash)
+(defun git-branch-off--parse-commit (hash)
   "Return plist for HASH: :tree :parent :author-name :author-email :author-date
 :committer-name :committer-email :committer-date."
   (let (result)
@@ -53,7 +26,7 @@
         (setq result (plist-put result :committer-date  (match-string 3 line))))))
     result))
 
-(defun branch-off/magit-reword--new-commit (info new-parent msg)
+(defun git-branch-off--new-commit (info new-parent msg)
   "Create a commit object from INFO plist, overriding parent with NEW-PARENT and message with MSG.
 NEW-PARENT nil keeps the :parent from INFO.  Return new hash string."
   (let* ((tree   (plist-get info :tree))
@@ -71,12 +44,11 @@ NEW-PARENT nil keeps the :parent from INFO.  Return new hash string."
                        (when parent (list "-p" parent)))))
     (apply #'magit-git-string args)))
 
-(defun branch-off/magit-reword--cascade-branch-off (remap)
+(defun git-branch-off--cascade (remap)
   "Rewrite all refs/branch-off/* whose parent changed according to REMAP.
 Scans all branch-off refs; for each whose parent is a key in REMAP, creates
 a new commit with the updated parent, replaces the ref, and adds the mapping
-to REMAP.  Repeats until no further refs change, so chains of branch-off
-commits are fully propagated.  Returns the augmented remap."
+to REMAP.  Repeats until no further refs change.  Returns the augmented remap."
   (let ((bo-refs (split-string
                   (with-temp-buffer
                     (call-process "git" nil t nil "for-each-ref"
@@ -86,11 +58,11 @@ commits are fully propagated.  Returns the augmented remap."
         (changed nil))
     (dolist (ref bo-refs)
       (let* ((bo-hash   (magit-git-string "rev-parse" ref))
-             (bo-info   (branch-off/magit-reword--parse-commit bo-hash))
+             (bo-info   (git-branch-off--parse-commit bo-hash))
              (bo-parent (plist-get bo-info :parent))
              (new-par   (cdr (assoc bo-parent remap))))
         (when new-par
-          (let ((new-bo (branch-off/magit-reword--new-commit
+          (let ((new-bo (git-branch-off--new-commit
                          bo-info new-par
                          (with-temp-buffer
                            (call-process "git" nil t nil "log" "-1" "--format=%B" bo-hash)
@@ -100,10 +72,39 @@ commits are fully propagated.  Returns the augmented remap."
             (push (cons bo-hash new-bo) remap)
             (setq changed t)))))
     (if changed
-        (branch-off/magit-reword--cascade-branch-off remap)
+        (git-branch-off--cascade remap)
       remap)))
 
-(defun branch-off/magit-reword--apply (hash new-msg)
+;;; Reword
+
+(defvar-local git-branch-off--reword-commit nil)
+(defvar-local git-branch-off--reword-source-buffer nil)
+(defvar-local git-branch-off--reword-source-line nil)
+(defvar-local git-branch-off--reword-from-revision nil)
+
+(defun git-branch-off--reword-fix-highlight ()
+  "Reposition highlights to the current line after a programmatic cursor move."
+  (mapc #'delete-overlay magit-section-highlight-overlays)
+  (setq magit-section-highlight-overlays nil)
+  (hl-line-highlight))
+
+(defun git-branch-off--reword-refresh-log (line)
+  "Refresh the magit-log buffer and restore point to LINE."
+  (when-let ((log-buf (magit-get-mode-buffer 'magit-log-mode)))
+    (with-current-buffer log-buf (magit-refresh))
+    (when-let ((win (get-buffer-window log-buf)))
+      (with-selected-window win
+        (goto-char (point-min))
+        (forward-line (1- line))
+        (git-branch-off--reword-fix-highlight))
+      (run-with-timer 0 nil
+        (lambda ()
+          (when-let ((w (get-buffer-window log-buf)))
+            (with-selected-window w
+              (forward-line 1)
+              (forward-line -1))))))))
+
+(defun git-branch-off--reword-apply (hash new-msg)
   "Reword HASH with NEW-MSG using git plumbing.
 For branch-off refs, rewrites the commit and cascades through any chained
 branch-off descendants.  For current-branch commits, rebases all descendants,
@@ -113,12 +114,12 @@ updates the branch ref, then cascades through all affected branch-off refs."
          (is-branch-off  (equal full-hash
                                 (magit-git-string "rev-parse" "--verify" branch-off-ref))))
     (if is-branch-off
-        (let* ((info     (branch-off/magit-reword--parse-commit full-hash))
-               (new-hash (branch-off/magit-reword--new-commit info nil new-msg)))
+        (let* ((info     (git-branch-off--parse-commit full-hash))
+               (new-hash (git-branch-off--new-commit info nil new-msg)))
           (unless new-hash (user-error "git commit-tree failed"))
           (magit-call-git "update-ref" (format "refs/branch-off/%s" new-hash) new-hash)
           (magit-call-git "update-ref" "-d" branch-off-ref)
-          (branch-off/magit-reword--cascade-branch-off (list (cons full-hash new-hash))))
+          (git-branch-off--cascade (list (cons full-hash new-hash))))
       (let ((branch (magit-git-string "symbolic-ref" "--short" "HEAD")))
         (unless branch
           (user-error "Cannot reword a branch commit in detached HEAD state"))
@@ -132,51 +133,51 @@ updates the branch ref, then cascades through all affected branch-off refs."
                           (buffer-string))
                         "\n" t))
                (remap  nil)
-               (target-info (branch-off/magit-reword--parse-commit full-hash))
-               (new-target  (branch-off/magit-reword--new-commit target-info nil new-msg)))
+               (target-info (git-branch-off--parse-commit full-hash))
+               (new-target  (git-branch-off--new-commit target-info nil new-msg)))
           (unless new-target (user-error "git commit-tree failed"))
           (push (cons full-hash new-target) remap)
           (dolist (old-hash (cdr chain))
-            (let* ((info       (branch-off/magit-reword--parse-commit old-hash))
+            (let* ((info       (git-branch-off--parse-commit old-hash))
                    (old-parent (plist-get info :parent))
                    (new-parent (or (cdr (assoc old-parent remap)) old-parent))
                    (msg        (with-temp-buffer
                                  (call-process "git" nil t nil "log" "-1" "--format=%B" old-hash)
                                  (buffer-string)))
-                   (new-hash   (branch-off/magit-reword--new-commit info new-parent msg)))
+                   (new-hash   (git-branch-off--new-commit info new-parent msg)))
               (push (cons old-hash new-hash) remap)))
           (magit-call-git "update-ref"
                           (format "refs/heads/%s" branch)
                           (cdr (assoc (car (last chain)) remap)))
-          (branch-off/magit-reword--cascade-branch-off remap))))))
+          (git-branch-off--cascade remap))))))
 
-(defun branch-off/magit-reword--finish ()
+(defun git-branch-off--reword-finish ()
   "Reword the target commit using git plumbing."
   (interactive)
   (let ((msg           (string-trim (buffer-substring-no-properties (point-min) (point-max))))
-        (hash          branch-off/magit-reword--commit)
+        (hash          git-branch-off--reword-commit)
         (dir           default-directory)
-        (source        branch-off/magit-reword--source-buffer)
-        (line          branch-off/magit-reword--source-line)
-        (from-revision branch-off/magit-reword--from-revision))
+        (source        git-branch-off--reword-source-buffer)
+        (line          git-branch-off--reword-source-line)
+        (from-revision git-branch-off--reword-from-revision))
     (kill-buffer-and-window)
     (let ((default-directory dir))
-      (branch-off/magit-reword--apply hash msg)
+      (git-branch-off--reword-apply hash msg)
       (when (and from-revision (buffer-live-p source))
         (kill-buffer source))
-      (branch-off/magit-reword--refresh-log line))))
+      (git-branch-off--reword-refresh-log line))))
 
-(defun branch-off/magit-reword--abort ()
+(defun git-branch-off--reword-abort ()
   "Abort reword without applying changes."
   (interactive)
   (kill-buffer-and-window)
   (message "reword: aborted"))
 
-(defun branch-off/magit-commit-reword (commit)
+(defun git-branch-off-reword (commit)
   "Reword COMMIT message, editing in a dedicated buffer.
 Pre-fills the buffer with the current message.  C-c C-c applies, C-c C-k aborts.
-Works for both branch commits (rebases descendants and updates any branch-off refs
-whose parents are in the rewritten chain) and refs/branch-off/ commits directly."
+Works for both branch commits (rebases descendants and updates branch-off refs)
+and refs/branch-off/ commits directly."
   (interactive (list (or (magit-commit-at-point)
                          (and (derived-mode-p 'magit-revision-mode)
                               magit-buffer-revision)
@@ -191,19 +192,19 @@ whose parents are in the rewritten chain) and refs/branch-off/ commits directly.
          (msg          (with-temp-buffer
                          (magit-git-insert "log" "-1" "--format=%B" commit)
                          (buffer-string)))
-         (buf        (get-buffer-create
-                      (format "*reword %s*" (substring commit 0 (min 7 (length commit)))))))
+         (buf          (get-buffer-create
+                        (format "*reword %s*" (substring commit 0 (min 7 (length commit)))))))
     (with-current-buffer buf
       (erase-buffer)
       (insert msg)
       (git-commit-mode)
       (setq-local default-directory dir)
-      (setq-local branch-off/magit-reword--commit commit)
-      (setq-local branch-off/magit-reword--source-buffer source-buf)
-      (setq-local branch-off/magit-reword--source-line source-line)
-      (setq-local branch-off/magit-reword--from-revision from-revision)
-      (local-set-key (kbd "C-c C-c") #'branch-off/magit-reword--finish)
-      (local-set-key (kbd "C-c C-k") #'branch-off/magit-reword--abort)
+      (setq-local git-branch-off--reword-commit commit)
+      (setq-local git-branch-off--reword-source-buffer source-buf)
+      (setq-local git-branch-off--reword-source-line source-line)
+      (setq-local git-branch-off--reword-from-revision from-revision)
+      (local-set-key (kbd "C-c C-c") #'git-branch-off--reword-finish)
+      (local-set-key (kbd "C-c C-k") #'git-branch-off--reword-abort)
       (setq-local header-line-format
                   (list " "
                         (propertize "C-c C-c" 'face 'transient-key)
@@ -213,169 +214,84 @@ whose parents are in the rewritten chain) and refs/branch-off/ commits directly.
       (goto-char (point-min)))
     (pop-to-buffer buf)))
 
-(defun branch-off/magit-commit-remove--chain-tips (full-hash)
-  "Return list of tip descriptors that have FULL-HASH as ancestor (inclusive).
-Each descriptor is a plist with keys:
-  :hash    — full tip commit hash
-  :type    — \\='bo (branch-off ref) or \\='wt (detached worktree HEAD)
-  :ref     — ref name (\\='bo only)
-  :wt-dir  — worktree directory path (\\='wt only)"
-  (let (result)
-    ;; branch-off ref tips
-    (dolist (ref (split-string
-                  (with-temp-buffer
-                    (call-process "git" nil t nil "for-each-ref"
-                                  "--format=%(refname)" "refs/branch-off/")
-                    (buffer-string))
-                  "\n" t))
-      (let ((tip-hash (magit-git-string "rev-parse" ref)))
-        (when (and tip-hash
-                   (= 0 (call-process "git" nil nil nil
-                                      "merge-base" "--is-ancestor" full-hash tip-hash)))
-          (push (list :hash tip-hash :type 'bo :ref ref) result))))
-    ;; detached-HEAD worktree tips — commits added inside a worktree after branch-off
-    (let (current-wt current-head is-detached)
-      (dolist (line (split-string
-                     (with-temp-buffer
-                       (call-process "git" nil t nil "worktree" "list" "--porcelain")
-                       (buffer-string))
-                     "\n"))
-        (cond
-         ((string-prefix-p "worktree " line)
-          (setq current-wt (substring line 9) current-head nil is-detached nil))
-         ((string-prefix-p "HEAD " line)
-          (setq current-head (substring line 5)))
-         ((string= line "detached")
-          (setq is-detached t))
-         ((string-blank-p line)
-          (when (and current-wt current-head is-detached
-                     (= 0 (call-process "git" nil nil nil
-                                        "merge-base" "--is-ancestor" full-hash current-head)))
-            (push (list :hash current-head :type 'wt :wt-dir current-wt) result))
-          (setq current-wt nil current-head nil is-detached nil)))))
-    result))
+;;; Remove
 
-(defun branch-off/magit-commit-remove--rebase-drop (full-hash top)
-  "Remove FULL-HASH from the current branch via `git rebase --onto'.
-On conflict git pauses in mid-rebase state; magit shows the normal REBASING UI
-and the user resolves with the usual flow then `git rebase --continue'.
-After a clean rebase, cascades branch-off refs via the old→new commit remap.
-Returns \\='rebase-ok or \\='rebase-conflict."
-  (let* ((short          (substring full-hash 0 8))
-         (removed-parent (plist-get (branch-off/magit-reword--parse-commit full-hash) :parent))
-         (default-directory top))
-    (unless removed-parent
-      (user-error "Cannot remove root commit %s via rebase" short))
-    (let ((old-chain (split-string
-                      (with-temp-buffer
-                        (call-process "git" nil t nil "rev-list" "--reverse"
-                                      (concat full-hash "..HEAD"))
-                        (buffer-string))
-                      "\n" t)))
-      (if (/= 0 (call-process "git" nil nil nil "rebase" "--onto"
-                               removed-parent full-hash))
-          (progn
-            (message "Conflict removing %s — resolve in magit then `git rebase --continue'"
-                     short)
-            'rebase-conflict)
-        (let* ((new-chain (split-string
-                           (with-temp-buffer
-                             (call-process "git" nil t nil "rev-list" "--reverse"
-                                           (concat removed-parent "..HEAD"))
-                             (buffer-string))
-                           "\n" t))
-               (remap (append (list (cons full-hash removed-parent))
-                              (cl-mapcar #'cons old-chain new-chain))))
-          (branch-off/magit-reword--cascade-branch-off remap)
-          'rebase-ok)))))
+(defun git-branch-off--remove-tips-for (full-hash)
+  "Return branch-off tip hashes that have FULL-HASH as ancestor (inclusive)."
+  (cl-remove-if-not
+   (lambda (tip)
+     (= 0 (call-process "git" nil nil nil "merge-base" "--is-ancestor" full-hash tip)))
+   (split-string
+    (with-temp-buffer
+      (call-process "git" nil t nil "for-each-ref" "--format=%(objectname)" "refs/branch-off/")
+      (buffer-string))
+    "\n" t)))
 
-(defun branch-off/magit-commit-remove--one (full-hash top)
-  "Remove FULL-HASH from its chain(s) or current branch.
-For branch-off/worktree chains: rewrites commits, updates refs (conflict-free).
-For regular branch commits with no chain: uses `git rebase --onto' with full
-conflict detection — git pauses on conflict for normal magit resolution flow.
-After any successful operation cascades branch-off refs via the commit remap.
-TOP is the git toplevel."
-  (let* ((short (substring full-hash 0 8))
-         (tips  (branch-off/magit-commit-remove--chain-tips full-hash)))
-    (if (null tips)
-        ;; not in any branch-off/worktree chain — try regular branch rebase
-        (if (= 0 (call-process "git" nil nil nil
-                                "merge-base" "--is-ancestor" full-hash "HEAD"))
-            (branch-off/magit-commit-remove--rebase-drop full-hash top)
-          (user-error "Commit %s is not an ancestor of HEAD or any branch-off chain" short))
-      ;; found in chain(s) — plumbing-based rewrite (trees preserved)
-      (let* ((is-bo-tip (equal full-hash
-                               (magit-git-string "rev-parse" "--verify"
-                                                 (format "refs/branch-off/%s" full-hash))))
-             (bo-wt-dir (when (and top is-bo-tip)
-                          (expand-file-name (concat ".worktree/" full-hash) top)))
-             (bo-wt-exists (and bo-wt-dir (file-exists-p bo-wt-dir)))
-             (proceed t))
-        (when bo-wt-exists
-          (let ((status (branch-off/delete-worktree--status bo-wt-dir)))
-            (when (and (not (string= status "clean"))
-                       (not (y-or-n-p (format "Worktree %s has changes (%s) — remove anyway? "
-                                              short status))))
-              (setq proceed nil))))
-        (if (not proceed)
-            'skipped
-          (let* ((removed-info   (branch-off/magit-reword--parse-commit full-hash))
-                 (removed-parent (plist-get removed-info :parent))
-                 (remap          (list (cons full-hash removed-parent))))
-            (dolist (tip-desc tips)
-              (let ((tip      (plist-get tip-desc :hash))
-                    (tip-type (plist-get tip-desc :type))
-                    (tip-ref  (plist-get tip-desc :ref))
-                    (tip-wt   (plist-get tip-desc :wt-dir)))
-                (if (equal tip full-hash)
-                    (pcase tip-type
-                      ('bo (magit-call-git "update-ref" "-d" tip-ref))
-                      ('wt (when (and removed-parent (file-exists-p tip-wt))
-                             (call-process "git" nil nil nil
-                                           "-C" tip-wt "reset" "--soft" removed-parent))))
-                  (let ((path (split-string
-                               (with-temp-buffer
-                                 (call-process "git" nil t nil "rev-list"
-                                               "--ancestry-path" "--reverse"
-                                               (format "%s..%s" full-hash tip))
-                                 (buffer-string))
-                               "\n" t)))
-                    (dolist (c path)
-                      (let* ((info    (branch-off/magit-reword--parse-commit c))
-                             (old-par (plist-get info :parent))
-                             (new-par (or (cdr (assoc old-par remap)) old-par))
-                             (msg     (with-temp-buffer
-                                        (call-process "git" nil t nil "log" "-1" "--format=%B" c)
-                                        (buffer-string)))
-                             (new-c   (branch-off/magit-reword--new-commit info new-par msg)))
-                        (push (cons c new-c) remap)))
-                    (let ((new-tip (cdr (assoc tip remap))))
-                      (pcase tip-type
-                        ('bo (when new-tip
-                               (magit-call-git "update-ref"
-                                               (format "refs/branch-off/%s" new-tip) new-tip)
-                               (magit-call-git "update-ref" "-d" tip-ref)))
-                        ('wt (when (and new-tip (file-exists-p tip-wt))
-                               (call-process "git" nil nil nil
-                                             "-C" tip-wt "reset" "--soft" new-tip)))))))))
-            (when (and is-bo-tip bo-wt-exists)
-              (with-temp-buffer
-                (unless (= 0 (call-process "git" nil t nil "worktree" "remove" "--force" bo-wt-dir))
-                  (message "Warning: could not remove worktree for %s: %s"
-                           short (string-trim (buffer-string))))))
-            (branch-off/magit-reword--cascade-branch-off remap)
-            (if (and is-bo-tip bo-wt-exists) 'ref-and-wt 'chain-rewrite)))))
+(defun git-branch-off--remove-one (full-hash top)
+  "Remove FULL-HASH from its branch-off chain(s), rewriting descendants as needed.
+Interior commits have their successors rebased onto the removed commit's parent.
+TOP is the git toplevel.  Returns \\='skipped, \\='ref-and-wt, or \\='chain-rewrite."
+  (let* ((short     (substring full-hash 0 8))
+         (is-tip    (equal full-hash
+                           (magit-git-string "rev-parse" "--verify"
+                                             (format "refs/branch-off/%s" full-hash))))
+         (wt-dir    (when (and top is-tip)
+                      (expand-file-name (concat ".worktree/" full-hash) top)))
+         (wt-exists (and wt-dir (file-exists-p wt-dir)))
+         (tips      (git-branch-off--remove-tips-for full-hash))
+         (proceed   t))
+    (unless tips
+      (user-error "Commit %s is not part of any branch-off chain" short))
+    (when wt-exists
+      (let ((status (git-branch-off--worktree-status wt-dir)))
+        (when (and (not (string= status "clean"))
+                   (not (y-or-n-p (format "Worktree %s has changes (%s) — remove anyway? "
+                                          short status))))
+          (setq proceed nil))))
+    (if (not proceed)
+        'skipped
+      (let* ((removed-info   (git-branch-off--parse-commit full-hash))
+             (removed-parent (plist-get removed-info :parent))
+             (remap          (list (cons full-hash removed-parent))))
+        (dolist (tip tips)
+          (if (equal tip full-hash)
+              (magit-call-git "update-ref" "-d" (format "refs/branch-off/%s" full-hash))
+            (let ((path (split-string
+                         (with-temp-buffer
+                           (call-process "git" nil t nil "rev-list"
+                                         "--ancestry-path" "--reverse"
+                                         (format "%s..%s" full-hash tip))
+                           (buffer-string))
+                         "\n" t)))
+              (dolist (c path)
+                (let* ((info    (git-branch-off--parse-commit c))
+                       (old-par (plist-get info :parent))
+                       (new-par (or (cdr (assoc old-par remap)) old-par))
+                       (msg     (with-temp-buffer
+                                  (call-process "git" nil t nil "log" "-1" "--format=%B" c)
+                                  (buffer-string)))
+                       (new-c   (git-branch-off--new-commit info new-par msg)))
+                  (push (cons c new-c) remap)))
+              (let* ((new-tip (cdr (assoc tip remap)))
+                     (old-ref (format "refs/branch-off/%s" tip)))
+                (when new-tip
+                  (magit-call-git "update-ref" (format "refs/branch-off/%s" new-tip) new-tip)
+                  (magit-call-git "update-ref" "-d" old-ref))))))
+        (when (and is-tip wt-exists)
+          (with-temp-buffer
+            (unless (= 0 (call-process "git" nil t nil "worktree" "remove" "--force" wt-dir))
+              (message "Warning: could not remove worktree for %s: %s"
+                       short (string-trim (buffer-string))))))
+        (git-branch-off--cascade remap)
+        (if (and is-tip wt-exists) 'ref-and-wt 'chain-rewrite)))))
 
-(defun branch-off/magit-commit-remove (commit)
+(defun git-branch-off-remove (commit)
   "Remove commit(s) from their branch-off chain(s), rewriting descendants as needed.
 
 From magit-log: reads m/M markers first, then visual selection, then the
 commit at point.  Works for both chain tips and interior commits.  Commits
 not part of any branch-off chain signal an error per commit.  Dirty
-worktrees prompt y/n.  Marks are cleared after removal.  Multiple commits
-from the same chain are processed descendants-first so each removal sees
-the updated chain state left by prior removals.
+worktrees prompt y/n.  Marks are cleared after removal.
 
 From magit-revision or anywhere else: operates on COMMIT only."
   (interactive
@@ -387,62 +303,52 @@ From magit-revision or anywhere else: operates on COMMIT only."
           (t (or (magit-commit-at-point)
                  (magit-read-branch-or-commit "Remove commit from branch-off chain"))))))
   (if (not (derived-mode-p 'magit-log-mode))
-      ;; ── single-commit path ──────────────────────────────────────────────────
       (let* ((full-hash (magit-git-string "rev-parse" commit))
-             (result    (branch-off/magit-commit-remove--one full-hash (magit-toplevel))))
+             (result    (git-branch-off--remove-one full-hash (magit-toplevel))))
         (magit-refresh)
         (pcase result
-          ('skipped          (message "Skipped %s" (substring full-hash 0 8)))
-          ('ref-and-wt       (message "Removed branch-off ref and worktree for %s"
-                                      (substring full-hash 0 8)))
-          ('rebase-ok        (message "Removed %s from branch" (substring full-hash 0 8)))
-          ('rebase-conflict  nil)  ; --rebase-drop already messaged
-          (_                 (message "Removed %s from branch-off chain"
-                                      (substring full-hash 0 8)))))
-    ;; ── multi-commit path (magit-log-mode) ──────────────────────────────────
+          ('skipped    (message "Skipped %s" (substring full-hash 0 8)))
+          ('ref-and-wt (message "Removed branch-off ref and worktree for %s"
+                                (substring full-hash 0 8)))
+          (_           (message "Removed %s from branch-off chain" (substring full-hash 0 8)))))
     (let* ((raw (cond
-                 ((bound-and-true-p branch-off/magit-squash--marks)
-                  branch-off/magit-squash--marks)
+                 ((bound-and-true-p git-branch-off--squash-marks)
+                  git-branch-off--squash-marks)
                  ((use-region-p)
                   (mapcar (lambda (h) (magit-git-string "rev-parse" h))
-                          (branch-off/magit-squash--commits-in-region)))
+                          (git-branch-off--squash-commits-in-region)))
                  (t (when-let ((h (magit-section-value-if 'commit)))
                       (list (magit-git-string "rev-parse" h))))))
            (_ (unless raw (user-error "No commits selected")))
            (top (magit-toplevel))
-           ;; descendants first: each removal sees the updated chain state
            (sorted (sort (copy-sequence raw)
                          (lambda (a b)
                            (= 0 (call-process "git" nil nil nil
                                               "merge-base" "--is-ancestor" b a))))))
-      (let (removed failed (conflict nil))
+      (let (removed failed)
         (dolist (full-hash sorted)
-          (unless conflict
-            (condition-case err
-                (let ((result (branch-off/magit-commit-remove--one full-hash top)))
-                  (cond
-                   ((eq result 'rebase-conflict)
-                    (setq conflict (substring full-hash 0 8)))
-                   ((not (eq result 'skipped))
-                    (push (cons (substring full-hash 0 8) result) removed))))
-              (error (push (format "%s: %s" (substring full-hash 0 8)
-                                   (error-message-string err))
-                           failed)))))
-        (when (bound-and-true-p branch-off/magit-squash--marks)
-          (setq branch-off/magit-squash--marks nil)
-          (branch-off/magit-squash--clear-overlays))
+          (condition-case err
+              (let ((result (git-branch-off--remove-one full-hash top)))
+                (unless (eq result 'skipped)
+                  (push (cons (substring full-hash 0 8) result) removed)))
+            (error (push (format "%s: %s" (substring full-hash 0 8)
+                                 (error-message-string err))
+                         failed))))
+        (when (bound-and-true-p git-branch-off--squash-marks)
+          (setq git-branch-off--squash-marks nil)
+          (git-branch-off--squash-clear-overlays))
         (magit-refresh)
         (cond
-         (conflict
-          (message "Removed %d; paused on conflict at %s — resolve then `git rebase --continue'"
-                   (length removed) conflict))
          (failed
           (message "Removed %d; errors — %s"
                    (length removed) (string-join (nreverse failed) " | ")))
          (removed
           (let* ((with-wt (cl-count 'ref-and-wt removed :key #'cdr))
                  (shorts  (mapcar #'car (nreverse removed))))
-            (message "Removed%s: %s"
+            (message "Removed from branch-off chain%s: %s"
                      (if (> with-wt 0) " (+worktree)" "")
                      (string-join shorts " "))))
-         (t (message "Nothing removed")))))))))
+         (t (message "Nothing removed")))))))
+
+(provide 'git-branch-off-reword)
+;;; git-branch-off-reword.el ends here
