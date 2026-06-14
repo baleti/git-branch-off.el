@@ -41,6 +41,7 @@
 
 ;;; Code:
 
+(eval-when-compile (require 'evil nil t))
 (require 'git-branch-off-stage)
 (require 'git-branch-off-commit)
 (require 'git-branch-off-log)
