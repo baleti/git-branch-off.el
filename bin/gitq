@@ -103,11 +103,23 @@
    ((or (null args) (member (car args) '("-h" "--help")))
     (gitq--cli-usage)
     (kill-emacs (if args 0 1)))
+
+   ;; --complete PREFIX  →  print completion candidates, one per line.
+   ;; Used by the zsh _gitq function and the Emacs CAPF can call this too.
+   ((equal (car args) "--complete")
+    (condition-case _
+        (let* ((default-directory (gitq--toplevel))
+               (prefix   (mapconcat #'identity (cdr args) " "))
+               (cands    (gitq--complete-candidates prefix)))
+          (dolist (c cands) (princ c) (terpri)))
+      (error nil))
+    (kill-emacs 0))
+
    (t
     (let ((pipeline (mapconcat #'identity args " ")))
       (condition-case err
           (let* ((default-directory (gitq--toplevel))
-                 (nodes    (gitq--parse pipeline))
+                 (nodes    (gitq--parse-flat pipeline))
                  (src-node (car nodes))
                  (rest     (cdr nodes))
                  (last     (car (last rest)))

@@ -990,11 +990,11 @@ Examples:
 
 ;;;###autoload
 (defun gitq-interactive ()
-  "Prompt for and execute a gitq pipeline with minibuffer history."
+  "Prompt for and execute a gitq pipeline with TAB completion."
   (interactive)
-  (let ((p (read-from-minibuffer "gitq> " nil nil nil 'gitq--history)))
+  (let ((p (gitq--read-pipeline "gitq> ")))
     (unless (string-empty-p (string-trim p))
-      (gitq p))))
+      (gitq-flat p))))
 
 ;;; Flat-syntax pipeline parser (whitespace-separated stages, /terminal keywords)
 ;;
@@ -1319,6 +1319,123 @@ No pipe character required."
           (error "gitq: expected step keyword or /terminal, got '%s'" tok)))))
     (nreverse nodes)))
 
+;;; Completion
+
+(defconst gitq--complete-source-keywords
+  '("commits" "branches" "tags" "refs" "worktrees" "blobs" "HEAD")
+  "Source keywords offered at the start of a pipeline.")
+
+(defconst gitq--complete-morphisms
+  '(".parent" ".parent*" ".parent+" ".tree" ".tree.blobs" ".tree.subtrees"
+    ".tree.entries" ".tree.entries[Blob]" ".tree.entries[Tree]"
+    ".diff" ".diff.hunks" ".history" ".commit")
+  "Morphism paths offered after `via'.")
+
+(defconst gitq--complete-field-names
+  '(".sha" ".author" ".email" ".date" ".message" ".path" ".name"
+    ".branch" ".parents-count" ".modified" ".staged" ".untracked")
+  "Field names offered after `where', `sort', `pick', and comma separators.")
+
+(defconst gitq--complete-where-operators
+  '("==" "!=" ">" "<" ">=" "<=" "contains" "matches" "after" "before" "within" "is")
+  "Operators offered after a field name in a where clause.")
+
+(defconst gitq--complete-terminals
+  '("/show" "/copy" "/insert" "/count" "/branch-off" "/amend"
+    "/squash" "/reword" "/remove" "/delete" "/commit" "/stage" "/mark" "/worktree")
+  "Terminal /command keywords.")
+
+(defun gitq--complete-candidates (input)
+  "Return a list of completion candidates for the pipeline string INPUT.
+INPUT is everything typed so far; completions extend the last partial word."
+  (let* ((trimmed    (string-trim-right input))
+         (trailing   (not (equal trimmed input)))  ; trailing whitespace?
+         (tokens     (gitq--tokenize-flat trimmed))
+         ;; In-progress partial word (nil when trailing whitespace)
+         (partial    (unless trailing (car (last tokens))))
+         ;; Tokens that are fully typed
+         (ctx        (if trailing tokens (butlast tokens)))
+         (n          (length ctx))
+         (last-ctx   (when (> n 0) (nth (1- n) ctx)))
+         (prev-ctx   (when (> n 1) (nth (- n 2) ctx))))
+    (cond
+     ;; Start of pipeline → source keywords
+     ((= n 0)
+      gitq--complete-source-keywords)
+
+     ;; After "commits" at position 1 → "in" or steps/terminals
+     ((and (= n 1) (equal last-ctx "commits"))
+      (cons "in" (append gitq--flat-step-keywords gitq--complete-terminals)))
+
+     ;; After "commits in" → branch and tag names from git
+     ((and (equal last-ctx "in") (equal prev-ctx "commits"))
+      (ignore-errors
+        (append (gitq--git "branch" "--format=%(refname:short)")
+                (gitq--git "tag" "--list"))))
+
+     ;; After "via" → morphisms
+     ((equal last-ctx "via")
+      gitq--complete-morphisms)
+
+     ;; After "where" or "," (start of another condition) → field names
+     ((or (equal last-ctx "where") (equal last-ctx ","))
+      gitq--complete-field-names)
+
+     ;; After a .field not preceded by "via" or "sort" → where operators
+     ((and last-ctx (string-prefix-p "." last-ctx)
+           (not (member prev-ctx '("via" "sort"))))
+      gitq--complete-where-operators)
+
+     ;; After "sort" → field names with optional "-" negation prefix
+     ((equal last-ctx "sort")
+      (append gitq--complete-field-names
+              (mapcar (lambda (f) (concat "-" f)) gitq--complete-field-names)))
+
+     ;; After "pick" or pick-comma → field names
+     ((or (equal last-ctx "pick")
+          (and (equal last-ctx ",") (member "pick" ctx)))
+      gitq--complete-field-names)
+
+     ;; After a where-operator → dynamic values (authors etc.)
+     ((member last-ctx gitq--complete-where-operators)
+      (let ((field (when (> n 1) (nth (- n 2) ctx))))
+        (when (member field '(".author" ".email"))
+          (ignore-errors
+            (delete-dups (gitq--git "log" "--format=%an" "--all"))))))
+
+     ;; Otherwise → step keywords + terminals
+     (t (append gitq--flat-step-keywords gitq--complete-terminals)))))
+
+(defun gitq-completion-at-point ()
+  "CAPF for gitq pipeline strings in the minibuffer.
+Works with corfu, company, vertico, and vanilla `completion-at-point'."
+  (when (minibufferp)
+    (let* ((start  (minibuffer-prompt-end))
+           (input  (buffer-substring-no-properties start (point)))
+           ;; Find the start of the partial word being typed
+           (trimmed   (string-trim-right input))
+           (trailing  (not (equal trimmed input)))
+           (tokens    (gitq--tokenize-flat trimmed))
+           (partial   (if trailing "" (or (car (last tokens)) "")))
+           (beg       (- (point) (length partial)))
+           (end       (point))
+           (candidates (gitq--complete-candidates input)))
+      (when candidates
+        (list beg end candidates :exclusive 'no)))))
+
+(defun gitq--read-pipeline (prompt)
+  "Read a gitq pipeline from the minibuffer with TAB completion.
+Wires `gitq-completion-at-point' into `completion-at-point-functions'
+so it works with corfu, company, vertico, and plain `completion-at-point'."
+  (minibuffer-with-setup-hook
+      (lambda ()
+        (add-hook 'completion-at-point-functions
+                  #'gitq-completion-at-point nil t)
+        ;; Bind TAB to completion-at-point (works in vanilla Emacs too).
+        (use-local-map (copy-keymap (current-local-map)))
+        (local-set-key (kbd "TAB") #'completion-at-point))
+    (read-from-minibuffer prompt nil nil nil 'gitq--history)))
+
 ;;;###autoload
 (defun gitq-flat (pipeline)
   "Execute a GitQ PIPELINE using flat syntax (whitespace-separated, /terminal).
@@ -1336,12 +1453,15 @@ Step keywords are reserved: quote them when used as values.
   CORRECT:  commits where .message contains \"take\" take 5 /show
   WRONG:    commits where .message contains take take 5 /show  (error)
 
+Press TAB for context-aware completion in the minibuffer.
+Works with corfu, company, vertico, and vanilla `completion-at-point'.
+
 Examples:
   (gitq-flat \"commits take 10 /show\")
   (gitq-flat \"commits where .author contains \\\"alice\\\" take 5 /count\")
   (gitq-flat \"HEAD via .parent* where .message contains \\\"fix\\\" /show\")
   (gitq-flat \"commits in main..HEAD sort -.date /show\")"
-  (interactive "sGitQ (flat): ")
+  (interactive (list (gitq--read-pipeline "gitq> ")))
   (let* ((default-directory (gitq--toplevel))
          (nodes    (gitq--parse-flat pipeline))
          (src-node (car nodes))
