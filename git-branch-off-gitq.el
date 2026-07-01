@@ -973,7 +973,7 @@ Examples:
   (gitq \"commits | where .author contains \\\"alice\\\" | take 10 | show\")
   (gitq \"HEAD | via .parent* | take 3 | squash \\\"consolidated\\\"\")
   (gitq \"commits | where .message contains \\\"fix\\\" | pick .sha, .date, .message\")"
-  (interactive "sGitQ: ")
+  (interactive (list (gitq--read-pipeline "gitq (pipe syntax)> ")))
   (let* ((default-directory (gitq--toplevel))
          (nodes    (gitq--parse pipeline))
          (src-node (car nodes))
@@ -1406,13 +1406,29 @@ INPUT is everything typed so far; completions extend the last partial word."
      ;; Otherwise → step keywords + terminals
      (t (append gitq--flat-step-keywords gitq--complete-terminals)))))
 
+(defun gitq--pipeline-completion-table (str pred action)
+  "Completion table for a gitq pipeline string STR.
+Returns full-pipeline candidates (prefix + token) so vertico/corfu can display
+and filter them correctly without needing a separate CAPF layer."
+  (if (eq action 'metadata)
+      '(metadata (category . gitq-pipeline))
+    (let* ((trimmed  (string-trim-right str))
+           (trailing (not (equal trimmed str)))
+           (tokens   (gitq--tokenize-flat trimmed))
+           (partial  (if trailing "" (or (car (last tokens)) "")))
+           (prefix   (substring str 0 (- (length str) (length partial))))
+           (cands    (gitq--complete-candidates str))
+           (full     (mapcar (lambda (c) (concat prefix c)) (or cands '()))))
+      (complete-with-action action full str pred))))
+
 (defun gitq-completion-at-point ()
   "CAPF for gitq pipeline strings in the minibuffer.
-Works with corfu, company, vertico, and vanilla `completion-at-point'."
+Fallback for environments that call `completion-at-point' directly
+(e.g. vanilla Emacs, company-capf).  Vertico uses the completing-read
+table instead and does not call this."
   (when (minibufferp)
     (let* ((start  (minibuffer-prompt-end))
            (input  (buffer-substring-no-properties start (point)))
-           ;; Find the start of the partial word being typed
            (trimmed   (string-trim-right input))
            (trailing  (not (equal trimmed input)))
            (tokens    (gitq--tokenize-flat trimmed))
@@ -1424,17 +1440,12 @@ Works with corfu, company, vertico, and vanilla `completion-at-point'."
         (list beg end candidates :exclusive 'no)))))
 
 (defun gitq--read-pipeline (prompt)
-  "Read a gitq pipeline from the minibuffer with TAB completion.
-Wires `gitq-completion-at-point' into `completion-at-point-functions'
-so it works with corfu, company, vertico, and plain `completion-at-point'."
-  (minibuffer-with-setup-hook
-      (lambda ()
-        (add-hook 'completion-at-point-functions
-                  #'gitq-completion-at-point nil t)
-        ;; Bind TAB to completion-at-point (works in vanilla Emacs too).
-        (use-local-map (copy-keymap (current-local-map)))
-        (local-set-key (kbd "TAB") #'completion-at-point))
-    (read-from-minibuffer prompt nil nil nil 'gitq--history)))
+  "Read a gitq pipeline from the minibuffer with context-aware completion.
+Uses `completing-read' so vertico, corfu, selectrum, and vanilla TAB all work.
+The completion table returns full-pipeline strings so the framework's own
+filtering logic sees each candidate as an extension of what was typed."
+  (completing-read prompt #'gitq--pipeline-completion-table
+                   nil nil nil 'gitq--history))
 
 ;;;###autoload
 (defun gitq-flat (pipeline)
